@@ -1,0 +1,37 @@
+# status|action|package|deny_build_globs|purpose_reason_and_risk
+# apply entries are the only ones touched by `canta-pm optimize`; review/block entries are never auto-applied.
+# The notes distinguish purpose from the reason to disable; performance gains are not assumed.
+# Build exclusions match ro.build.version.incremental; comma separates shell-style patterns; '-' means no exclusion.
+# Package descriptions and risk labels are cross-checked against the UAD community catalog, not guaranteed for every Xiaomi build:
+# https://github.com/Universal-Debloater-Alliance/universal-android-debloater/blob/main/resources/assets/uad_lists.json
+# Missing or not-installed packages are skipped. One package per row.
+
+apply|disable|com.miui.analytics|-|用途：小米分析/统计组件。理由：停用可减少分析与反馈相关后台行为；是否省电或提速没有保证。风险：依赖它的遥测/反馈可能不再工作；UAD 标为 Recommended。
+apply|disable|com.miui.bugreport|-|用途：Mi Feedback/错误报告。理由：不使用小米问题反馈时可停用报告入口。风险：无法通过该组件提交系统问题；UAD 标为 Recommended。
+apply|disable|com.miui.systemAdSolution|-|用途：MIUI 系统广告/广告推荐相关组件。理由：不需要系统广告时停用。风险：部分系统推荐或广告位可能变化；UAD 标为 Recommended。
+apply|disable|com.miui.msa.global|-|用途：全球版系统广告服务。理由：不使用系统广告时可停用。风险：全球版广告推荐可能变化；国行常见为不存在，缺失时自动跳过；UAD 标为 Recommended。
+apply|uninstall|com.miui.thirdappassistant|-|用途：小米第三方应用异常分析/崩溃卡顿提示。无需相关诊断提示时可对当前用户按用户卸载，保留系统 APK。风险：异常提示或反馈可能不可用，依赖此服务的功能可能受影响；可用 canta-pm restore 恢复。
+
+review|disable|com.miui.hybrid|-|用途：小米快应用运行环境。理由：不用快应用时可考虑停用。风险：依赖快应用的入口或服务会失效；社区目录标为 Recommended，但本清单要求人工确认。
+review|disable|com.miui.hybrid.accessory|-|用途：快应用配套组件。理由：只有决定停用快应用环境后才考虑。风险：与 hybrid 相关的配套功能不可用；UAD 说明它支持 com.miui.hybrid。
+review|disable|com.miui.personalassistant|-|用途：部分机型用于 App Vault/个人助理。理由：不用负一屏助理功能时可考虑停用。风险：负一屏或相关入口可能消失；功能随系统版本变化。
+review|disable|com.miui.carlink|-|用途：CarWith/小米车联。理由：不使用该车载连接功能时可考虑停用。风险：依赖 CarWith 的车辆连接不可用；社区资料称其主要面向中国市场。
+review|disable|com.xiaomi.aiasst.service|-|用途：小爱 AI 通话助手相关服务。理由：不用 AI 通话辅助时可考虑停用。风险：相关通话设置/助手能力可能失效；UAD 将其列为 AI Call Assistant。
+review|disable|com.xiaomi.aiasst.vision|-|用途：AI 助手视觉配套组件。理由：只有不用对应 AI 通话助手时才考虑。风险：依赖视觉组件的助手功能不可用；UAD 称移除 AI Call Assistant 后才不需要它。
+review|disable|com.xiaomi.aicr|-|用途：小米 AI 引擎相关组件。理由：仅在确认不用相关 AI 功能后考虑。风险：社区报告可能影响壁纸设置；UAD 标为 Advanced。
+review|disable|com.mobiletools.systemhelper|-|用途：SystemHelper；社区资料只确认它与双卡和应用信息页有关，具体职责不清。理由：暂不据此认定有优化收益。风险：可能影响双卡/应用信息功能，先在本机验证。
+review|disable|com.sohu.inputmethod.sogou.xiaomi|-|用途：小米定制搜狗中文输入法。理由：已有并启用替代键盘后才考虑。风险：停用前若无替代键盘会失去输入能力；UAD 标为中文键盘。
+review|disable|com.miui.cloudservice|*CNXM|用途：小米云相关服务。理由：只有不使用小米云且确认依赖后才考虑。风险：云端同步/备份等功能可能受影响；国行构建按规则跳过。
+review|disable|com.miui.micloudsync|*CNXM|用途：小米云数据同步组件。理由：只有不使用小米云同步时才考虑。风险：联系人、照片、消息等同步可能受影响；国行构建按规则跳过。
+
+review|disable|com.android.adservices.api|-|用途：Android AdServices/Privacy Sandbox 平台组件，不等同于小米广告应用。理由：停用不是通用性能优化。风险：使用 Privacy Sandbox API 的应用功能可能受影响；需确认 Android 版本和用途。
+review|disable|com.android.browser|-|用途：系统自带浏览器。理由：已安装并设好替代浏览器时可考虑。风险：浏览器链接可能无默认处理应用；这属于用户应用选择，不是普遍提速项。
+review|disable|com.android.egg|-|用途：Android 彩蛋/隐藏小游戏。理由：不用该隐藏内容时可以停用，但通常没有可测的性能收益。风险：失去彩蛋入口。
+review|disable|com.xiaomi.aireco|-|用途：社区 APK 目录将其标为 HyperOS AI's Advice。理由：当前公开说明不足以证明它是负担或必需项。风险：可能影响 AI 建议入口；先核对本机应用名称和功能。
+review|disable|com.android.virtualization.terminal|-|用途：Android Virtualization Framework 提供的 Linux/Debian 虚拟机终端，不是 Android 主机 shell。理由：若不用可保持禁用；它默认可能就是关闭的，因此再次停用通常没有收益。
+
+block|-|com.android.microdroid.empty_payload|-|用途：Android 虚拟化框架的测试/空载荷组件。理由：无明显可见功能或优化收益。风险：可能被虚拟化测试流程需要；保持原状。
+block|-|com.android.packageinstaller|-|用途：Android 应用安装器组件。理由：安装 APK 和应用更新相关核心路径，不作为精简目标；脚本也会保护此包。
+block|-|com.android.devicelockcontroller|-|用途：Android 设备锁定/受管理设备相关组件。理由：可能供运营商、融资或设备管理策略使用；脚本保护此包，避免影响设备锁策略。
+block|-|com.miui.securitycenter|-|用途：小米系统安全中心。理由：涉及安全、权限和设备维护，不作为清理目标；脚本保护此包。
+block|-|com.miui.securitycore|-|用途：小米安全核心组件。理由：属于系统安全依赖，不作为清理目标；脚本保护此包。

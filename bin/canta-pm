@@ -1,0 +1,652 @@
+#!/bin/sh
+set -eu
+set -f
+umask 077
+
+: "${XDG_STATE_HOME:=$HOME/.local/state}"
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+RISH=${RISH:-$HOME/.local/bin/rish}
+STATE_DIR=$XDG_STATE_HOME/canta-pm
+LEDGER=$STATE_DIR/changes.tsv
+LOCK=$STATE_DIR/lock
+MANIFEST=${CANTA_PM_MANIFEST:-$XDG_CONFIG_HOME/canta-pm/packages.tsv}
+
+die() {
+    printf 'canta-pm: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  canta-pm list
+  canta-pm plan-list
+  canta-pm optimize
+  canta-pm apply-list
+  canta-pm list-disabled
+  canta-pm list-uninstalled
+  canta-pm managed
+  canta-pm plan PACKAGE...
+  canta-pm apply PACKAGE...
+  canta-pm uninstall-system PACKAGE...
+  canta-pm restore [PACKAGE...]
+  canta-pm restore-existing PACKAGE...
+
+All package changes target the current Android user. `apply` uses
+pm disable-user and records the original enabled state for `restore`.
+`uninstall-system` uses `pm uninstall -k --user` only for system packages;
+`restore` brings them back with `pm install-existing` and restores their state.
+`restore-existing` reinstalls a package for this user only when Android
+still has its APK (normally a preinstalled/system app).
+
+`list` shows the local package manifest; `plan-list` evaluates it against the
+phone's MIUI/HyperOS build. `optimize` applies only manifest rows marked `apply`
+and not excluded by their build patterns. Rows marked `review` or `block` are
+never changed by `optimize`. Changes are reversible with `restore`.
+EOF
+}
+
+remote() {
+    remote_command="exec 2>&1; ( $1 ); __canta_remote_rc=\$?; printf '\\n__CANTA_REMOTE_RC__%s\\n' \"\$__canta_remote_rc\""
+    remote_output=$("$RISH" -c "$remote_command" </dev/null 2>&1) || {
+        printf '%s\n' "$remote_output" >&2
+        return 1
+    }
+    remote_status=$(printf '%s\n' "$remote_output" | sed -n 's/^__CANTA_REMOTE_RC__//p' | tail -n 1)
+    case "$remote_status" in
+        ''|*[!0-9]*) printf '%s\n' "$remote_output" >&2; return 1 ;;
+    esac
+    if [ "$remote_status" -ne 0 ]; then
+        printf '%s\n' "$remote_output" | sed '$d' >&2
+        return 1
+    fi
+    printf '%s\n' "$remote_output" | sed '$d'
+}
+
+valid_package() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_.]*|.*|*.|*..*) return 1 ;;
+        *.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+protected_package() {
+    case "$1" in
+        android|com.android.systemui|com.android.settings|com.android.providers.settings|\
+        com.android.packageinstaller|com.google.android.packageinstaller|\
+        com.android.permissioncontroller|com.google.android.permissioncontroller|\
+        com.android.phone|com.android.server.telecom|com.android.providers.telephony|\
+        com.android.providers.media|com.android.providers.media.module|\
+        com.android.launcher3|com.miui.home|com.android.shell|\
+        com.android.devicelockcontroller|\
+        com.google.android.gms|com.google.android.gsf|com.miui.securitycenter|com.miui.securitycore)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+preflight() {
+    [ -x "$RISH" ] || die "rish executable not found: $RISH"
+    probe=$(remote 'printf "%s\n" "__CANTA_USER__" "$(am get-current-user)" "__CANTA_BUILD__" "$(getprop ro.build.version.incremental)" "__CANTA_MIUI__" "$(getprop ro.miui.ui.version.name)"') || die 'Shizuku/rish is not responding. Open Shizuku, confirm Termux is authorized, and retry.'
+    CURRENT_USER=$(printf '%s\n' "$probe" | awk '/^__CANTA_USER__$/ { section = "user"; next } /^__CANTA_BUILD__$/ { section = "build"; next } /^__CANTA_MIUI__$/ { section = "miui"; next } section == "user" && /^[0-9][0-9]*$/ { print; exit }')
+    case "$CURRENT_USER" in
+        '') die 'rish returned no current-user id; Shizuku may have timed out. Reopen Shizuku and retry.' ;;
+        *[!0-9]*) die "unexpected current user id: $CURRENT_USER" ;;
+    esac
+    CURRENT_BUILD=$(printf '%s\n' "$probe" | awk '/^__CANTA_BUILD__$/ { section = 1; next } /^__CANTA_MIUI__$/ { section = 0 } section { print; exit }')
+    CURRENT_MIUI_VERSION=$(printf '%s\n' "$probe" | awk '/^__CANTA_MIUI__$/ { section = 1; next } section { print; exit }')
+    case "$CURRENT_BUILD" in
+        OS*) CURRENT_FAMILY=HyperOS ;;
+        V*) CURRENT_FAMILY=MIUI ;;
+        *)
+            case "$CURRENT_MIUI_VERSION" in
+                OS*) CURRENT_FAMILY=HyperOS ;;
+                V*) CURRENT_FAMILY=MIUI ;;
+                *) CURRENT_FAMILY=unknown ;;
+            esac
+            ;;
+    esac
+    mkdir -p "$STATE_DIR"
+}
+
+require_supported_family() {
+    case "$CURRENT_FAMILY" in
+        MIUI|HyperOS) : ;;
+        *) die "could not identify a MIUI/HyperOS build (incremental='$CURRENT_BUILD', MIUI version='$CURRENT_MIUI_VERSION'); refusing manifest actions" ;;
+    esac
+}
+
+valid_manifest_row() {
+    case "$row_status" in
+        apply|review) case "$row_action" in disable|uninstall) : ;; *) return 1 ;; esac ;;
+        block) [ "$row_action" = - ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    valid_package "$row_package" || return 1
+    [ -n "$row_note" ] || return 1
+    case "$row_deny" in
+        ''|-) : ;;
+        ,*|*,|*,,*) return 1 ;;
+        *[!A-Za-z0-9._*?,-]*) return 1 ;;
+    esac
+}
+
+validate_manifest() {
+    [ -r "$MANIFEST" ] || die "package manifest not readable: $MANIFEST"
+    line_number=0
+    while IFS='|' read -r row_status row_action row_package row_deny row_note || [ -n "${row_status:-}${row_action:-}${row_package:-}${row_deny:-}${row_note:-}" ]; do
+        line_number=$((line_number + 1))
+        case "${row_status:-}" in ''|\#*) continue ;; esac
+        if ! valid_manifest_row; then
+            die "invalid manifest row at $MANIFEST:$line_number (expected status|action|package|deny_build_globs|note)"
+        fi
+    done < "$MANIFEST"
+}
+
+build_excluded() {
+    match_build=$1
+    patterns=$2
+    case "$patterns" in ''|-) return 1 ;; esac
+    saved_ifs=$IFS
+    IFS=,
+    for deny_pattern in $patterns; do
+        case "$deny_pattern" in
+            ''|*[!A-Za-z0-9._*?-]*) IFS=$saved_ifs; return 2 ;;
+        esac
+        case "$match_build" in
+            $deny_pattern) IFS=$saved_ifs; return 0 ;;
+        esac
+    done
+    IFS=$saved_ifs
+    return 1
+}
+
+manifest_list() {
+    validate_manifest
+    printf 'Manifest: %s\n' "$MANIFEST"
+    printf '%-8s %-10s %-42s %-24s %s\n' STATUS ACTION PACKAGE DENY_BUILD_GLOBS NOTE
+    while IFS='|' read -r row_status row_action row_package row_deny row_note || [ -n "${row_status:-}${row_action:-}${row_package:-}${row_deny:-}${row_note:-}" ]; do
+        case "${row_status:-}" in ''|\#*) continue ;; esac
+        printf '%-8s %-10s %-42s %-24s %s\n' "$row_status" "$row_action" "$row_package" "$row_deny" "$row_note"
+    done < "$MANIFEST"
+}
+
+manifest_plan() {
+    validate_manifest
+    require_supported_family
+    printf 'Device: %s %s (MIUI version: %s), Android user %s\n' "$CURRENT_FAMILY" "$CURRENT_BUILD" "${CURRENT_MIUI_VERSION:-unknown}" "$CURRENT_USER"
+    while IFS='|' read -r row_status row_action row_package row_deny row_note || [ -n "${row_status:-}${row_action:-}${row_package:-}${row_deny:-}${row_note:-}" ]; do
+        case "${row_status:-}" in ''|\#*) continue ;; esac
+        if build_excluded "$CURRENT_BUILD" "$row_deny"; then
+            printf '%s: SKIP (build excluded by %s) — %s\n' "$row_package" "$row_deny" "$row_note"
+            continue
+        else
+            match_status=$?
+            [ "$match_status" -eq 1 ] || die "invalid build exclusion pattern for $row_package"
+        fi
+        case "$row_status" in
+            block)
+                printf '%s: BLOCKED by manifest — %s\n' "$row_package" "$row_note"
+                ;;
+            review)
+                printf '%s: REVIEW only; suggested action=%s — %s\n' "$row_package" "$row_action" "$row_note"
+                ;;
+            apply)
+                printf '%s: ELIGIBLE (%s) — %s\n' "$row_package" "$row_action" "$row_note"
+                show_state "$CURRENT_USER" "$row_package" "$row_action"
+                ;;
+        esac
+    done < "$MANIFEST"
+}
+
+manifest_apply() {
+    validate_manifest
+    require_supported_family
+    acquire_lock
+    failed=0
+    while IFS='|' read -r row_status row_action row_package row_deny row_note || [ -n "${row_status:-}${row_action:-}${row_package:-}${row_deny:-}${row_note:-}" ]; do
+        case "${row_status:-}" in ''|\#*) continue ;; esac
+        if build_excluded "$CURRENT_BUILD" "$row_deny"; then
+            printf '%s: skipped by build exclusion %s\n' "$row_package" "$row_deny"
+            continue
+        else
+            match_status=$?
+            [ "$match_status" -eq 1 ] || die "invalid build exclusion pattern for $row_package"
+        fi
+        case "$row_status" in
+            block)
+                printf '%s: blocked by manifest; unchanged\n' "$row_package"
+                ;;
+            review)
+                printf '%s: review-only entry; unchanged\n' "$row_package"
+                ;;
+            apply)
+                case "$row_action" in
+                    disable) if ! apply_one "$CURRENT_USER" "$row_package"; then failed=1; fi ;;
+                    uninstall) if ! uninstall_system_one "$CURRENT_USER" "$row_package"; then failed=1; fi ;;
+                esac
+                ;;
+        esac
+    done < "$MANIFEST"
+    [ "$failed" -eq 0 ] || exit 1
+}
+
+user_entry() {
+    entry_user=$1
+    entry_package=$2
+    remote "dumpsys package $entry_package | awk -v uid='$entry_user' '
+        \$1 == \"User\" && \$2 == uid \":\" {
+            if (found) next
+            installed = \"?\"
+            enabled = \"?\"
+            for (i = 3; i <= NF; i++) {
+                if (index(\$i, \"installed=\") == 1) {
+                    installed = substr(\$i, 11)
+                }
+                if (index(\$i, \"enabled=\") == 1) {
+                    enabled = substr(\$i, 9)
+                }
+            }
+            print installed \"\t\" enabled
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    '"
+}
+
+listed_enabled() {
+    list=$(remote "pm list packages -e --user $1 $2") || return 1
+    printf '%s\n' "$list" | awk -v p="package:$2" '$0 == p { found = 1 } END { exit !found }'
+}
+
+listed_system() {
+    list=$(remote "pm list packages -s --user $1 $2") || return 1
+    printf '%s\n' "$list" | awk -v p="package:$2" '$0 == p { found = 1 } END { exit !found }'
+}
+
+ledger_has() {
+    [ -f "$LEDGER" ] || return 1
+    awk -F '\t' -v u="$1" -v p="$2" '$1 == u && $2 == p { found = 1 } END { exit !found }' "$LEDGER"
+}
+
+ledger_add() {
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$LEDGER"
+}
+
+ledger_remove() {
+    [ -f "$LEDGER" ] || return 0
+    temp=$LEDGER.tmp.$$
+    awk -F '\t' -v u="$1" -v p="$2" '!( $1 == u && $2 == p )' "$LEDGER" > "$temp"
+    mv "$temp" "$LEDGER"
+}
+
+acquire_lock() {
+    mkdir -p "$STATE_DIR"
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        die "another canta-pm operation is running, or a stale lock exists at $LOCK"
+    fi
+    trap 'rmdir "$LOCK" 2>/dev/null || :' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+show_state() {
+    state=$(user_entry "$1" "$2") || {
+        printf '%s: package state unavailable\n' "$2"
+        return 0
+    }
+    installed=$(printf '%s\n' "$state" | cut -f 1)
+    enabled=$(printf '%s\n' "$state" | cut -f 2)
+    if [ "$installed" != true ]; then
+        printf '%s: not installed for user %s\n' "$2" "$1"
+    elif listed_enabled "$1" "$2"; then
+        case "${3:-}" in
+            disable) printf '%s: enabled (setting=%s); apply would disable for user %s\n' "$2" "$enabled" "$1" ;;
+            uninstall) printf '%s: enabled (setting=%s); apply would uninstall for user %s\n' "$2" "$enabled" "$1" ;;
+            *) printf '%s: enabled (setting=%s) for user %s\n' "$2" "$enabled" "$1" ;;
+        esac
+    else
+        printf '%s: installed but disabled (setting=%s) for user %s\n' "$2" "$enabled" "$1"
+    fi
+}
+
+apply_one() {
+    uid=$1
+    package=$2
+    valid_package "$package" || {
+        printf '%s: invalid package name; skipped\n' "$package" >&2
+        return 0
+    }
+    if protected_package "$package"; then
+        printf '%s: protected core package; skipped\n' "$package"
+        return 0
+    fi
+    if ledger_has "$uid" "$package"; then
+        printf '%s: already managed by canta-pm; unchanged\n' "$package"
+        return 0
+    fi
+    state=$(user_entry "$uid" "$package") || {
+        printf '%s: package state unavailable; skipped\n' "$package"
+        return 0
+    }
+    installed=$(printf '%s\n' "$state" | cut -f 1)
+    enabled=$(printf '%s\n' "$state" | cut -f 2)
+    if [ "$installed" != true ]; then
+        printf '%s: not installed for user %s; skipped\n' "$package" "$uid"
+        return 0
+    fi
+    if ! listed_enabled "$uid" "$package"; then
+        printf '%s: already disabled; left unchanged and not added to restore ledger\n' "$package"
+        return 0
+    fi
+    case "$enabled" in
+        0|1) ;;
+        *) printf '%s: unexpected enabled state %s; skipped\n' "$package" "$enabled"; return 0 ;;
+    esac
+    ledger_add "$uid" "$package" "$enabled" disable
+    if remote "pm disable-user --user $uid $package" >/dev/null; then
+        check=$(user_entry "$uid" "$package") || check=
+        if [ "$(printf '%s\n' "$check" | cut -f 2)" = 3 ]; then
+            printf '%s: disabled for user %s (original setting=%s recorded)\n' "$package" "$uid" "$enabled"
+            return 0
+        fi
+        printf '%s: command returned success but state verification failed; restore record kept\n' "$package" >&2
+        return 1
+    fi
+    check=$(user_entry "$uid" "$package") || check=
+    if [ -z "$check" ]; then
+        printf '%s: result could not be verified; restore record kept\n' "$package" >&2
+    elif [ "$(printf '%s\n' "$check" | cut -f 2)" = 3 ]; then
+        printf '%s: command reported failure but package is disabled; restore record kept\n' "$package" >&2
+    else
+        ledger_remove "$uid" "$package"
+        printf '%s: disable failed; restore record removed\n' "$package" >&2
+    fi
+    return 1
+}
+
+uninstall_system_one() {
+    uid=$1
+    package=$2
+    valid_package "$package" || {
+        printf '%s: invalid package name; skipped\n' "$package" >&2
+        return 0
+    }
+    if protected_package "$package"; then
+        printf '%s: protected core package; skipped\n' "$package"
+        return 0
+    fi
+    if ledger_has "$uid" "$package"; then
+        printf '%s: already managed by canta-pm; unchanged\n' "$package"
+        return 0
+    fi
+    state=$(user_entry "$uid" "$package") || {
+        printf '%s: package state unavailable; skipped\n' "$package"
+        return 0
+    }
+    installed=$(printf '%s\n' "$state" | cut -f 1)
+    enabled=$(printf '%s\n' "$state" | cut -f 2)
+    if [ "$installed" != true ]; then
+        printf '%s: not installed for user %s; skipped\n' "$package" "$uid"
+        return 0
+    fi
+    if ! listed_system "$uid" "$package"; then
+        printf '%s: not classified as a system package; refusing Canta-style uninstall\n' "$package"
+        return 0
+    fi
+    if ! listed_enabled "$uid" "$package"; then
+        printf '%s: already disabled; left unchanged\n' "$package"
+        return 0
+    fi
+    case "$enabled" in
+        0|1) ;;
+        *) printf '%s: unexpected enabled state %s; skipped\n' "$package" "$enabled"; return 0 ;;
+    esac
+    ledger_add "$uid" "$package" "$enabled" uninstall
+    if remote "pm uninstall -k --user $uid $package" >/dev/null; then
+        check=$(user_entry "$uid" "$package") || check=
+        if [ "$(printf '%s\n' "$check" | cut -f 1)" = false ]; then
+            printf '%s: uninstalled for user %s; APK/data restore record kept\n' "$package" "$uid"
+            return 0
+        fi
+        printf '%s: command returned success but state verification failed; restore record kept\n' "$package" >&2
+        return 1
+    fi
+    check=$(user_entry "$uid" "$package") || check=
+    if [ -z "$check" ]; then
+        printf '%s: result could not be verified; restore record kept\n' "$package" >&2
+    elif [ "$(printf '%s\n' "$check" | cut -f 1)" = false ]; then
+        printf '%s: command reported failure but package is uninstalled; restore record kept\n' "$package" >&2
+    else
+        ledger_remove "$uid" "$package"
+        printf '%s: uninstall failed; restore record removed\n' "$package" >&2
+    fi
+    return 1
+}
+
+restore_one() {
+    uid=$1
+    package=$2
+    original=$3
+    action=${4:-disable}
+    state=$(user_entry "$uid" "$package") || {
+        printf '%s: cannot read state for user %s; restore record kept\n' "$package" "$uid" >&2
+        return 1
+    }
+    installed=$(printf '%s\n' "$state" | cut -f 1)
+    enabled=$(printf '%s\n' "$state" | cut -f 2)
+    if [ "$action" = uninstall ]; then
+        if [ "$installed" != true ]; then
+            if ! remote "pm install-existing --user $uid $package" >/dev/null; then
+                printf '%s: install-existing failed; restore record kept\n' "$package" >&2
+                return 1
+            fi
+            state=$(user_entry "$uid" "$package") || {
+                printf '%s: restored APK but could not read package state; restore record kept\n' "$package" >&2
+                return 1
+            }
+            installed=$(printf '%s\n' "$state" | cut -f 1)
+            enabled=$(printf '%s\n' "$state" | cut -f 2)
+        fi
+        if [ "$installed" != true ]; then
+            printf '%s: package is still uninstalled; restore record kept\n' "$package" >&2
+            return 1
+        fi
+        case "$original" in
+            0) command="pm default-state --user $uid $package" ;;
+            1) command="pm enable --user $uid $package" ;;
+            *) printf '%s: invalid saved state %s; restore record kept\n' "$package" "$original" >&2; return 1 ;;
+        esac
+        if [ "$enabled" != "$original" ] && ! remote "$command" >/dev/null; then
+            printf '%s: could not restore original enabled state; record kept\n' "$package" >&2
+            return 1
+        fi
+        check=$(user_entry "$uid" "$package") || check=
+        if [ "$(printf '%s\n' "$check" | cut -f 1)" = true ] && [ "$(printf '%s\n' "$check" | cut -f 2)" = "$original" ]; then
+            ledger_remove "$uid" "$package"
+            printf '%s: restored for user %s (original enabled state=%s)\n' "$package" "$uid" "$original"
+            return 0
+        fi
+        printf '%s: restore verification failed; record kept\n' "$package" >&2
+        return 1
+    fi
+    if [ "$installed" != true ]; then
+        printf '%s: not installed for user %s; restore record kept\n' "$package" "$uid" >&2
+        return 1
+    fi
+    if [ "$enabled" = "$original" ]; then
+        ledger_remove "$uid" "$package"
+        printf '%s: already restored; record cleared\n' "$package"
+        return 0
+    fi
+    if [ "$enabled" != 3 ]; then
+        printf '%s: state changed elsewhere (enabled=%s); not overwriting it; restore record kept\n' "$package" "$enabled" >&2
+        return 1
+    fi
+    case "$original" in
+        0) command="pm default-state --user $uid $package" ;;
+        1) command="pm enable --user $uid $package" ;;
+        *) printf '%s: invalid saved state %s; restore record kept\n' "$package" "$original" >&2; return 1 ;;
+    esac
+    if ! remote "$command" >/dev/null; then
+        printf '%s: restore command failed; record kept\n' "$package" >&2
+        return 1
+    fi
+    check=$(user_entry "$uid" "$package") || check=
+    if [ "$(printf '%s\n' "$check" | cut -f 2)" = "$original" ]; then
+        ledger_remove "$uid" "$package"
+        printf '%s: restored (original setting=%s)\n' "$package" "$original"
+        return 0
+    fi
+    printf '%s: restore verification failed; record kept\n' "$package" >&2
+    return 1
+}
+
+restore_existing_one() {
+    uid=$1
+    package=$2
+    valid_package "$package" || {
+        printf '%s: invalid package name; skipped\n' "$package" >&2
+        return 0
+    }
+    state=$(user_entry "$uid" "$package") || state=
+    if [ -n "$state" ] && [ "$(printf '%s\n' "$state" | cut -f 1)" = true ]; then
+        printf '%s: already installed for user %s\n' "$package" "$uid"
+        return 0
+    fi
+    all=$(remote "pm list packages -u --user $uid") || {
+        printf '%s: could not query package catalog\n' "$package" >&2
+        return 1
+    }
+    if ! printf '%s\n' "$all" | awk -v p="package:$package" '$0 == p { found = 1 } END { exit !found }'; then
+        printf '%s: Android no longer has this APK; reinstall it from its original store/source\n' "$package"
+        return 1
+    fi
+    if ! remote "pm install-existing --user $uid $package"; then
+        printf '%s: install-existing failed\n' "$package" >&2
+        return 1
+    fi
+    check=$(user_entry "$uid" "$package") || check=
+    if [ "$(printf '%s\n' "$check" | cut -f 1)" = true ]; then
+        printf '%s: installed for user %s\n' "$package" "$uid"
+        return 0
+    fi
+    printf '%s: install verification failed\n' "$package" >&2
+    return 1
+}
+
+command_name=${1:-}
+[ -n "$command_name" ] || { usage; exit 2; }
+shift
+
+case "$command_name" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    managed|status)
+        [ "$#" -eq 0 ] || die 'managed takes no package arguments'
+        if [ -f "$LEDGER" ] && [ -s "$LEDGER" ]; then
+            awk -F '\t' '{ printf "user %s  %-48s original_enabled_state=%s action=%s\n", $1, $2, $3, ($4 == "" ? "disable" : $4) }' "$LEDGER"
+        else
+            printf '%s\n' 'No changes are recorded by canta-pm.'
+        fi
+        exit 0
+        ;;
+    list)
+        [ "$#" -eq 0 ] || die 'list takes no package arguments'
+        manifest_list
+        exit 0
+        ;;
+esac
+
+preflight
+
+case "$command_name" in
+    plan-list)
+        [ "$#" -eq 0 ] || die 'plan-list takes no package arguments'
+        manifest_plan
+        ;;
+    optimize|apply-list)
+        [ "$#" -eq 0 ] || die 'optimize takes no package arguments'
+        manifest_apply
+        ;;
+    list-disabled)
+        [ "$#" -eq 0 ] || die 'list-disabled takes no package arguments'
+        remote "pm list packages -d --user $CURRENT_USER"
+        ;;
+    list-uninstalled)
+        [ "$#" -eq 0 ] || die 'list-uninstalled takes no package arguments'
+        remote "all=\$(pm list packages -u --user $CURRENT_USER) || exit 1; installed=\$(pm list packages --user $CURRENT_USER) || exit 1; { printf '%s\\n' \"\$all\"; printf '__CANTA_INSTALLED__\\n'; printf '%s\\n' \"\$installed\"; } | awk '
+            \$0 == \"__CANTA_INSTALLED__\" { installed_phase = 1; next }
+            substr(\$0, 1, 8) == \"package:\" {
+                package = substr(\$0, 9)
+                if (installed_phase) present[package] = 1
+                else all[++n] = package
+            }
+            END {
+                for (i = 1; i <= n; i++) if (!(all[i] in present)) print all[i]
+            }
+        ' | sort -u"
+        ;;
+    plan)
+        [ "$#" -gt 0 ] || die 'plan requires one or more package names'
+        for package do
+            valid_package "$package" || die "invalid package name: $package"
+            show_state "$CURRENT_USER" "$package"
+        done
+        ;;
+    apply)
+        [ "$#" -gt 0 ] || die 'apply requires one or more package names; no package is changed by default'
+        acquire_lock
+        failed=0
+        for package do
+            if ! apply_one "$CURRENT_USER" "$package"; then failed=1; fi
+        done
+        [ "$failed" -eq 0 ] || exit 1
+        ;;
+    uninstall-system)
+        [ "$#" -gt 0 ] || die 'uninstall-system requires one or more package names'
+        acquire_lock
+        failed=0
+        for package do
+            if ! uninstall_system_one "$CURRENT_USER" "$package"; then failed=1; fi
+        done
+        [ "$failed" -eq 0 ] || exit 1
+        ;;
+    restore)
+        acquire_lock
+        if [ ! -f "$LEDGER" ] || [ ! -s "$LEDGER" ]; then
+            printf '%s\n' 'No changes are recorded by canta-pm.'
+            exit 0
+        fi
+        failed=0
+        while IFS="$(printf '\t')" read -r uid package original action; do
+            [ -n "$uid" ] || continue
+            if [ "$#" -gt 0 ]; then
+                match=no
+                for wanted do
+                    if [ "$wanted" = "$package" ]; then match=yes; fi
+                done
+                [ "$match" = yes ] || continue
+            fi
+            if ! restore_one "$uid" "$package" "$original" "$action"; then failed=1; fi
+        done < "$LEDGER"
+        [ "${failed:-0}" -eq 0 ] || exit 1
+        ;;
+    restore-existing)
+        [ "$#" -gt 0 ] || die 'restore-existing requires one or more package names'
+        acquire_lock
+        failed=0
+        for package do
+            if ! restore_existing_one "$CURRENT_USER" "$package"; then failed=1; fi
+        done
+        [ "$failed" -eq 0 ] || exit 1
+        ;;
+    *)
+        usage >&2
+        die "unknown command: $command_name"
+        ;;
+esac
