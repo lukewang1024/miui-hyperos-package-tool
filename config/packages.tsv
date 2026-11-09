@@ -18,7 +18,7 @@ apply|disable|com.miui.personalassistant|-|用途：部分机型用于 App Vault
 apply|disable|com.miui.carlink|-|用途：CarWith/小米车联。理由：不使用该车载连接功能时可考虑停用。风险：依赖 CarWith 的车辆连接不可用；社区资料称其主要面向中国市场。
 apply|disable|com.xiaomi.aiasst.service|-|用途：小爱 AI 通话助手相关服务。理由：不用 AI 通话辅助时可考虑停用。风险：相关通话设置/助手能力可能失效；UAD 将其列为 AI Call Assistant。
 apply|disable|com.xiaomi.aiasst.vision|-|用途：AI 助手视觉配套组件。理由：只有不用对应 AI 通话助手时才考虑。风险：依赖视觉组件的助手功能不可用；UAD 称移除 AI Call Assistant 后才不需要它。
-apply|disable|com.xiaomi.aicr|-|用途：小米 AI 引擎相关组件。理由：仅在确认不用相关 AI 功能后考虑。风险：社区报告可能影响壁纸设置；UAD 标为 Advanced。
+block|-|com.xiaomi.aicr|-|用途：小米 HyperAI Engine 组件，官方隐私说明将其与“剪贴板快捷方式”读取相关联。理由：本机实测仅恢复此包后，复制链接“打开京东”提示恢复（com.xiaomi.aiasst.vision 仍卸载）；默认保留。风险：停用会失去该提示及依赖 HyperAI 的能力；此实测针对 OS3.0.307.0.WONCNXM。
 apply|disable|com.mobiletools.systemhelper|-|用途：SystemHelper；社区资料只确认它与双卡和应用信息页有关，具体职责不清。理由：暂不据此认定有优化收益。风险：可能影响双卡/应用信息功能，先在本机验证。
 apply|disable|com.sohu.inputmethod.sogou.xiaomi|-|用途：小米定制搜狗中文输入法。理由：已有并启用替代键盘后才考虑。风险：停用前若无替代键盘会失去输入能力；UAD 标为中文键盘。
 apply|disable|com.miui.cloudservice|*CNXM|用途：小米云相关服务。理由：只有不使用小米云且确认依赖后才考虑。风险：云端同步/备份等功能可能受影响；国行构建按规则跳过。
