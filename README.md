@@ -45,7 +45,7 @@ Start with the read-only plan:
 canta-pm plan-list
 ```
 
-The bundled list marks some entries `apply`; `canta-pm optimize` will act on those entries. Review every package and its note before running it:
+The bundled list is the maintainer's personal default profile, not a universal recommendation. `canta-pm optimize` acts on every `apply` entry without prompting. Review each package and its note before running it, and adjust the manifest to match your own device and usage:
 
 ```sh
 canta-pm optimize
